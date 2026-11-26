@@ -1,0 +1,3 @@
+dev.viren.extapi.config.ExtApiAutoConfiguration
+dev.viren.extapi.config.ExtApiAsyncAutoConfiguration
+dev.viren.extapi.config.ExtApiInboundWebhookAutoConfiguration
