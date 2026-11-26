@@ -719,3 +719,7 @@ The suite runs against real components, not mocks:
 ---
 
 <sub>Built with Kotlin 2.0, Spring Boot 3.5, Apache HttpClient 5.5, spring-kafka, Spring Data Redis.</sub>
+
+## License
+
+[Apache License 2.0](LICENSE).
