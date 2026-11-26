@@ -4,99 +4,61 @@
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.0-7F52FF?logo=kotlin&logoColor=white)
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5-6DB33F?logo=springboot&logoColor=white)
 ![Java](https://img.shields.io/badge/JDK-17%2B-ED8B00?logo=openjdk&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-68%20on%20real%20sockets-brightgreen)
 
-A Spring Boot starter for calling third-party HTTP APIs safely: payment providers, banks, KYC vendors, partner systems.
-
-Add the dependency, describe each upstream in `application.yml`, and inject a client. Every call then goes through retries that respect idempotency, a circuit breaker, a rate limiter (local or shared through Redis), a bulkhead and a total deadline. TLS and mTLS come from configuration, and failures arrive as one sealed exception type you can match on exhaustively. Calls that should not block a request can go through a **transactional outbox**, with Kafka or a local thread pool carrying the work and signed **webhooks** reporting the outcome.
+**A Spring Boot starter that makes calls to third-party APIs (payment providers, banks, partners) safe under failure.** It handles retries without double-charging, circuit breaking, rate limiting shared across instances, TLS/mTLS, and async delivery that survives crashes, all configured in YAML.
 
 ```kotlin
-val account = clients.client("payments").get<Account>("/accounts/42", operation = "get-account")
+val charge = clients.client("payments").post<Charge>("/charges", req, operation = "create-charge", idempotencyKey = "charge-$orderId")
 ```
+
+> **Reviewing this repo? Start here.** The [engineering highlights](#engineering-highlights) table links each skill to the code and the test that proves it. [Bugs the tests caught](#bugs-the-tests-caught) shows how it was verified. [Engineering choices](#engineering-choices) records every trade-off and the alternatives considered.
+
+| | |
+|---|---|
+| **Problem** | Outbound HTTP is where production incidents start: duplicate payments from blind retries, thread exhaustion when a provider hangs, quota bans from fleets that each think they own the limit, events lost between a DB commit and a publish. |
+| **Guarantees** | A POST is never retried unless it is provably safe · one deadline across all retries · fails fast while an upstream is unhealthy · one rate limit across every instance · an async call exists if and only if your transaction commits · TLS misconfiguration fails at startup, not on the first request |
+| **Size** | 28 source files (~2.7k lines of Kotlin), 11 test files, **68 tests** that run against a real HTTP/HTTPS server with a generated CA, embedded Kafka, H2 and Redis. No mocks of the network. |
+| **Stack** | Kotlin 2.0 · Spring Boot 3.5 (auto-configuration starter) · Apache HttpClient 5 · Kafka · Redis (Lua) · JDBC · Micrometer · GitHub Actions |
 
 ---
 
 ## Table of contents
 
-- [Why](#why)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Quick start](#quick-start)
-- [Making calls](#making-calls)
-- [Failure handling](#failure-handling)
-- [Retries and idempotency](#retries-and-idempotency)
-- [Circuit breaker](#circuit-breaker)
-- [Rate limiting](#rate-limiting)
-- [TLS and mTLS](#tls-and-mtls)
-- [Authentication](#authentication)
-- [Async calls: outbox + Kafka](#async-calls-outbox--kafka)
-- [Webhooks](#webhooks)
-- [Observability](#observability)
-- [Extension points](#extension-points)
-- [Configuration reference](#configuration-reference)
-- [Building and testing](#building-and-testing)
-- [Engineering choices](#engineering-choices)
-- [Skills used](#skills-used)
-- [Limitations and roadmap](#limitations-and-roadmap)
+**For reviewers:** [Engineering highlights](#engineering-highlights) · [Bugs the tests caught](#bugs-the-tests-caught) · [Architecture](#architecture) · [Why](#why) · [Engineering choices](#engineering-choices) · [Skills used](#skills-used)
+
+**For users:** [Features](#features) · [Quick start](#quick-start) · [Making calls](#making-calls) · [Failure handling](#failure-handling) · [Retries and idempotency](#retries-and-idempotency) · [Circuit breaker](#circuit-breaker) · [Rate limiting](#rate-limiting) · [TLS and mTLS](#tls-and-mtls) · [Authentication](#authentication) · [Async calls](#async-calls-outbox--kafka) · [Webhooks](#webhooks) · [Observability](#observability) · [Extension points](#extension-points) · [Configuration reference](#configuration-reference) · [Building and testing](#building-and-testing) · [Limitations and roadmap](#limitations-and-roadmap)
 
 ---
 
-## Why
+## Engineering highlights
 
-Most outbound HTTP code starts as `restTemplate.postForObject(...)` and collects edge cases one incident at a time:
+Each row names a skill, says what was built, and links the code and test that prove it.
 
-| Incident | Root cause | What this module does |
+| Skill | What I built | Proof |
 |---|---|---|
-| Customer charged twice | A POST was retried after a read timeout | POST/PATCH are retried only with an idempotency key. A read timeout on an unsafe call is reported as "outcome unknown" and never retried. |
-| Every request thread stuck for 30 s | The provider was down and each call waited for its own timeout | A circuit breaker fails fast while the upstream is unhealthy, and a bulkhead caps concurrent calls. |
-| Account suspended for quota abuse | 20 pods each enforced "100 rps" on their own | A Redis token bucket or sliding window is shared by all instances. A 429 `Retry-After` pauses every instance. |
-| Event lost on deploy | The call happened after the DB commit and the pod died in between | The transactional outbox stores the call in the same transaction as the business data. |
-| "Handshake failed" at 3 a.m. | A wrong trust store was found only on the first request | TLS material is validated at startup, with an error that names the client and the setting. |
+| **Failure semantics** | A sealed taxonomy of 15 failure types. Each says whether it is `retryable` and whether it should trip the breaker. Retries depend on idempotency: a read timeout on a POST is reported as *outcome unknown* and never resent. | [`ExternalApiException`](src/main/kotlin/dev/viren/extapi/error/ExternalApiException.kt) · [`FailureClassifier`](src/main/kotlin/dev/viren/extapi/error/FailureClassifier.kt) · tests `response timeout on POST is not retried because outcome is unknown`, `does not retry POST on 500 without idempotency key` in [`RestClientTest`](src/test/kotlin/dev/viren/extapi/http/RestClientTest.kt) |
+| **Resilience patterns** | A fixed pipeline: deadline → cooldown → rate limit → bulkhead → circuit breaker → HTTP → classify → retry. The breaker is a count-based state machine with failure-rate and slow-call thresholds, half-open probing, and no leaked probe slots. | [`DefaultExternalApiClient`](src/main/kotlin/dev/viren/extapi/http/DefaultExternalApiClient.kt) · [`CircuitBreaker`](src/main/kotlin/dev/viren/extapi/resilience/CircuitBreaker.kt) · [`CircuitBreakerTest`](src/test/kotlin/dev/viren/extapi/resilience/CircuitBreakerTest.kt) (9 tests, controllable clock) · `total deadline caps retries` |
+| **Distributed rate limiting** | Token bucket and sliding window as atomic Redis Lua scripts that use Redis server time (no clock skew), with Cluster-safe keys. Three fail modes for a Redis outage. A 429 `Retry-After` pauses the **whole fleet**. | [`RedisRateLimiter`](src/main/kotlin/dev/viren/extapi/ratelimit/RedisRateLimiter.kt) · [`RateLimitGate`](src/main/kotlin/dev/viren/extapi/ratelimit/RateLimitGate.kt) · `token bucket is shared and atomic across concurrent callers` (2 nodes, 8 threads, real Redis in CI) |
+| **Distributed-systems reliability** | Transactional outbox on plain JDBC. The database is the source of truth and Kafka carries only a row id. Rows are claimed with compare-and-set (portable, no `SKIP LOCKED`), leases recover crashed work, and the worker is idempotent. | [`OutboxRelay`](src/main/kotlin/dev/viren/extapi/outbox/OutboxRelay.kt) · [`AsyncCallWorker`](src/main/kotlin/dev/viren/extapi/outbox/AsyncCallWorker.kt) · [`OutboxRepository`](src/main/kotlin/dev/viren/extapi/outbox/OutboxRepository.kt) · `nothing is sent when the business transaction rolls back`, `calls flow relay to kafka to worker…` |
+| **Network security / PKI** | TLS, mTLS and pinning from PKCS12, PEM or Spring SSL bundles. Misconfiguration fails at startup. Handshake errors say what is wrong. The real TLS cause is recovered on dual-stack hosts. | [`TlsContextFactory`](src/main/kotlin/dev/viren/extapi/http/TlsContextFactory.kt) · [`TlsClientTest`](src/test/kotlin/dev/viren/extapi/http/TlsClientTest.kt) (9 tests against a real HTTPS server and generated CA) · [`gen-test-certs.sh`](scripts/gen-test-certs.sh) |
+| **Webhook security** | HMAC-SHA256 over `id.timestamp.body`, signed when the webhook is sent so retries hours later still pass freshness checks. Constant-time compare, secret rotation, a replay guard, and a 503 when the replay store is down. | [`Webhooks`](src/main/kotlin/dev/viren/extapi/webhook/Webhooks.kt) · [`InboundWebhooks`](src/main/kotlin/dev/viren/extapi/webhook/InboundWebhooks.kt) · [`WebhookTest`](src/test/kotlin/dev/viren/extapi/webhook/WebhookTest.kt) · `completion triggers a signed callback webhook` |
+| **Concurrency** | Breaker and limiters under a single lock. OAuth token refresh by one thread at a time (double-checked). A semaphore bulkhead. A non-blocking in-process transport. | [`AuthProvider`](src/main/kotlin/dev/viren/extapi/auth/AuthProvider.kt) · [`RetryPolicy` / `Bulkhead`](src/main/kotlin/dev/viren/extapi/resilience/RetryPolicy.kt) · `bulkhead rejects calls above the concurrency cap`, `oauth2 client credentials token is cached and refreshed after 401` |
+| **Library / platform design** | A Spring Boot starter: optional features via `@ConditionalOnClass`, every policy replaceable as a bean, its own Kafka producer and consumer so the host app's serializers are untouched, and startup validation. | [`ExtApiAutoConfiguration`](src/main/kotlin/dev/viren/extapi/config/ExtApiAutoConfiguration.kt) · [`ExtApiAsyncAutoConfiguration`](src/main/kotlin/dev/viren/extapi/config/ExtApiAsyncAutoConfiguration.kt) · [extension points](#extension-points) |
+| **Operability** | Micrometer metrics with low-cardinality tags (path templates, not ids). Correlation ids through MDC and async rows. Secrets masked in logs. Health reports `UNKNOWN`, not `DOWN`, for an open breaker, so a provider outage does not restart pods. | [`ApiMetrics`](src/main/kotlin/dev/viren/extapi/observability/ApiMetrics.kt) · [`CircuitBreakerHealthIndicator`](src/main/kotlin/dev/viren/extapi/observability/CircuitBreakerHealthIndicator.kt) · [`HttpLogFormatter`](src/main/kotlin/dev/viren/extapi/http/HttpLogFormatter.kt) |
+| **Testing discipline** | Real sockets, a real TLS handshake, embedded Kafka and Redis in CI. Failure injection (timeouts, refused connections, outages) and deterministic time. | [`TestServer`](src/test/kotlin/dev/viren/extapi/support/TestServer.kt) · [CI workflow](.github/workflows/ci.yml) · [`OutboxIntegrationTest`](src/test/kotlin/dev/viren/extapi/outbox/OutboxIntegrationTest.kt) |
 
-## Features
+## Bugs the tests caught
 
-**REST client**
-- Named clients, each with its own Apache HttpClient 5 connection pool, so one slow provider cannot starve the others
-- Separate connect, response and pool-acquire timeouts, plus a **total deadline** that covers all retries
-- JSON (Jackson + Kotlin), form-encoded, raw `String` and `ByteArray` bodies; path templates; a response size cap
-- Correlation id propagated from MDC (`correlationId` / `traceId`)
-- Request and response logging with secrets masked in headers, query strings and JSON fields
-- Clients can be registered at runtime (for example per-tenant endpoints)
+Writing integration tests against real infrastructure found three defects that mocks would have hidden:
 
-**Resilience**
-- Exponential backoff with jitter; `Retry-After` (seconds or HTTP date) is honoured
-- Idempotency-aware retries, with optional auto-generated `Idempotency-Key`
-- Count-based **circuit breaker** with failure-rate and slow-call-rate thresholds and half-open probing, per client or per operation
-- **Bulkhead** that caps concurrent calls
-- Transparent token refresh and a single retry on `401`
+| Defect | How it was found | Fix |
+|---|---|---|
+| **TLS failures were reported as "connection refused."** `localhost` resolves to both 127.0.0.1 and ::1. The HTTP client moved on to the second address after the handshake failed and reported only the last error. The same thing happens on any dual-stack production host. | A TLS test expected `TlsFailureException` and got `ConnectionFailedException` | A wrapping TLS strategy records the handshake failure on the calling thread, and the classifier reports it as the real cause ([`RecordingTlsStrategy`](src/main/kotlin/dev/viren/extapi/http/TlsContextFactory.kt)) |
+| **8 of 9 TLS tests never ran.** Kotlin expression-bodied tests returned a value, and JUnit silently skips non-`void` methods. | The test report showed `tests=1` for a class with 9 tests | Explicit `: Unit` return types; each suite's reported test count was then checked by hand |
+| **A Redis outage turned inbound webhooks into raw 500s.** The sender got no signal to retry. | An integration test with Redis unreachable | The replay check fails closed with **503** (the sender retries), and release is best-effort |
 
-**Rate limiting**
-- Token bucket or sliding window
-- LOCAL (in-JVM) or **REDIS** (atomic Lua using Redis server time, Redis Cluster-safe keys)
-- Per-client limit plus per-operation limits
-- Fail modes for a Redis outage: `OPEN`, `CLOSED` or `LOCAL_FALLBACK`
-- **Adaptive cooldown**: an upstream 429/503 with `Retry-After` pauses every caller and every instance
-
-**Security**
-- TLS modes `DEFAULT`, `TLS` (private CA), `MTLS`, and `INSECURE_TRUST_ALL` for development only
-- Key and trust material from PKCS12/JKS, PEM files, or a Spring Boot **SSL bundle**
-- SPKI **certificate pinning**, protocol and cipher allow-lists, a hostname-verification switch
-- Startup validation and expiry warnings for client certificates
-- Auth: Bearer, API key, Basic, OAuth2 client credentials (sent over the client's own mTLS), or your own provider
-
-**Async processing**
-- **Transactional outbox** on plain JDBC (works with JPA, jOOQ or JDBC); a call is scheduled only if your transaction commits
-- **Kafka** transport (multi-instance) or **IN_PROCESS** transport (no broker)
-- Retries with backoff for hours, dead-lettering, deduplication keys, scheduled calls (`notBefore`), cancel and requeue
-- Outcomes published to a result topic or DLT, to in-process listeners, and to **callback webhooks**
-- Crash-safe: work whose lease expires is recovered, and duplicate Kafka deliveries do nothing
-
-**Webhooks**
-- Outbound: HMAC-SHA256 signed when sent (so retries carry a fresh timestamp), delivered through the outbox, one circuit breaker per subscriber host
-- Inbound: signature, timestamp tolerance and **replay protection** (Redis or local), zero-downtime secret rotation, a handler registry
-
-**Operations**
-- Micrometer metrics (calls, attempts, retries, rejections, breaker state, async outcomes)
-- Actuator health indicator showing each breaker's state and failure rates
+---
 
 ## Architecture
 
@@ -148,6 +110,150 @@ stateDiagram-v2
     FAILED --> PENDING: requeue()
     DEAD --> PENDING: requeue()
 ```
+
+## Why
+
+Most outbound HTTP code starts as `restTemplate.postForObject(...)` and collects edge cases one incident at a time:
+
+| Incident | Root cause | What this module does |
+|---|---|---|
+| Customer charged twice | A POST was retried after a read timeout | POST/PATCH are retried only with an idempotency key. A read timeout on an unsafe call is reported as "outcome unknown" and never retried. |
+| Every request thread stuck for 30 s | The provider was down and each call waited for its own timeout | A circuit breaker fails fast while the upstream is unhealthy, and a bulkhead caps concurrent calls. |
+| Account suspended for quota abuse | 20 pods each enforced "100 rps" on their own | A Redis token bucket or sliding window is shared by all instances. A 429 `Retry-After` pauses every instance. |
+| Event lost on deploy | The call happened after the DB commit and the pod died in between | The transactional outbox stores the call in the same transaction as the business data. |
+| "Handshake failed" at 3 a.m. | A wrong trust store was found only on the first request | TLS material is validated at startup, with an error that names the client and the setting. |
+
+## Engineering choices
+
+Each choice below lists the alternatives considered and why this one won.
+
+### Architecture
+
+| Decision | Alternatives considered | Why this one |
+|---|---|---|
+| **Spring Boot starter with auto-configuration** | A plain library wired by hand; a sidecar or egress proxy (Envoy) | You add one dependency and some YAML. Optional features turn on through `@ConditionalOnClass` + properties, so a service without Kafka or Redis pays nothing. A sidecar handles TLS and rate limits but cannot know about idempotency keys or business transactions. |
+| **One connection pool per external system** | One shared `HttpClient` | Bulkheading at the socket level: a provider that hangs uses up only its own pool, never the pool another provider's calls need. |
+| **Fixed protection order:** cooldown → rate limit → bulkhead → circuit breaker → HTTP | Any other order | Cheap local checks first. A half-open probe permit is taken last, so it is never spent on a call that would have been throttled anyway. |
+| **A sealed exception hierarchy plus `FailureKind`** | Status codes; one generic exception with a message | The compiler checks `when` branches are exhaustive. Each failure carries `retryable` and `countsAsFailure`, so retry, breaker and async decisions are made once, in the classifier. |
+| **Every built-in bean is `@ConditionalOnMissingBean`** | Inheritance or configuration flags | Each policy (classifier, limiter store, transport, auth, metrics) can be replaced without forking. This is the open/closed principle at the bean level. |
+
+### Correctness under failure
+
+| Decision | Why |
+|---|---|
+| **Retries depend on idempotency.** A read timeout on a POST is classified as "outcome unknown" and never retried. | A retry is only safe when repeating cannot duplicate a side effect. This rule prevents double charges. |
+| **One total deadline across attempts** | Without it, 3 attempts × 10 s timeouts + backoff can far exceed what the caller's own caller will wait. |
+| **Retry-After wins over computed backoff; a large value fails fast** | The upstream knows its own recovery time. Sleeping a request thread for 2 minutes is worse than failing. |
+| **4xx and 429 do not trip the circuit breaker** | They mean the upstream is healthy but rejecting the request. Opening the breaker on them would black out good traffic. |
+| **Async treats local rejections as "not now"** | An open circuit or a rate limit is temporary. Background work can wait, while a user-facing call should fail fast. |
+| **Startup validation of TLS material and certificate expiry** | Misconfiguration surfaces at deploy time, not at 3 a.m. on the first request. |
+| **Recovering the real TLS error on dual-stack hosts** | Found by a test: Apache reports only the last address's error, so a certificate problem appeared as "connection refused". A thread-local records the handshake failure. |
+
+### Distributed systems
+
+| Decision | Alternatives considered | Why this one |
+|---|---|---|
+| **Transactional outbox** | Publish to Kafka after commit; Kafka transactions; CDC (Debezium) | Publishing after commit loses events if the process dies in between. Kafka transactions cannot include the business database. CDC needs extra infrastructure. The outbox needs only the database you already have. |
+| **The database is the source of truth; Kafka carries only a row id** | Full payload in the message | Lost, duplicated or reordered messages are all harmless, because every state change is a compare-and-set on the row. Payloads and secrets stay out of Kafka. |
+| **Compare-and-set claims (`UPDATE … WHERE status = ?`)** | `SELECT … FOR UPDATE SKIP LOCKED`; a distributed lock | Portable across PostgreSQL, MySQL, H2, Oracle and SQL Server, with no lock service. Contention costs at most a wasted `UPDATE`. |
+| **Mark QUEUED *before* publishing, with a lease** | Publish then mark | A worker can never receive a message for a row that is still PENDING. A crash between the two steps is repaired when the lease expires. |
+| **Rate limiting with Redis Lua and `redis.call('TIME')`** | `INCR` + `EXPIRE`; client timestamps | One script means one atomic read-modify-write across all instances. Server time removes clock skew between nodes. Hash-tagged keys keep it Redis Cluster-safe. |
+| **Configurable fail mode for a Redis outage** (`OPEN` / `CLOSED` / `LOCAL_FALLBACK`) | Always fail | Whether to protect the quota or availability is a business decision, so the module leaves it to you. |
+| **Adaptive cooldown shared through Redis** | Each instance learns about the 429 on its own | One 429 pauses the whole fleet instead of N pods each hitting the limit. |
+| **Circuit breaker state kept per instance** | Shared state in Redis | Each instance sees its own network path. A shared breaker would let one bad node black out the fleet, and it puts Redis on the hot path. |
+
+### Security
+
+| Decision | Why |
+|---|---|
+| **The HMAC covers `id.timestamp.body`** | Binding the id and timestamp into the MAC stops replaying an old body under a new timestamp. |
+| **Signing at delivery time, not when enqueued** | A webhook retried 6 hours later still passes the receiver's 5-minute freshness check. |
+| **Constant-time signature comparison and several active secrets** | Prevents timing attacks and allows secret rotation without downtime. |
+| **Replay store down → 503** | A 503 makes the sender retry. Accepting blindly could process the event twice; a 500 would hide the cause. |
+| **SPKI pinning on top of chain validation** | Pinning adds to normal validation instead of replacing it, and pins survive certificate renewal with the same key. |
+| **Secrets masked in headers, query strings and JSON bodies** | Logs are the most common place credentials leak. |
+
+### Tooling and testing
+
+| Decision | Alternatives considered | Why this one |
+|---|---|---|
+| **Own circuit breaker and retry** | Resilience4j | The policy depends on HTTP semantics: which statuses count as failures, POST safety, Retry-After, one deadline across attempts. Written as Resilience4j predicates, that logic spread across many places. This version is about 200 lines under a single lock, uses an injectable clock and is fully tested. |
+| **Apache HttpClient 5** | `RestClient`, `WebClient`, OkHttp | It gives direct control of the pool, the TLS strategy and exact exception types, which the failure taxonomy needs. |
+| **Plain JDBC for the outbox** | JPA entities | Works with any persistence stack and joins the caller's transaction through Spring's DataSource synchronization. |
+| **Real servers in tests** (JDK `HttpServer`/`HttpsServer`, `@EmbeddedKafka`, a Redis CI service) | Mocks / WireMock | Timeouts, TLS handshakes and Kafka redelivery only show up on real sockets. The dual-stack TLS bug above would have been invisible with mocks. |
+| **A generated throwaway PKI** (`scripts/gen-test-certs.sh`) | Committed certificates of unknown origin | Reproducible, documented, and with no secret value. |
+| **Injectable clocks and sleepers** | `Thread.sleep` in tests | Circuit breaker and rate limiter tests are deterministic and fast. |
+
+## Skills used
+
+| Area | Applied in this project |
+|---|---|
+| **Kotlin** | Sealed hierarchies, data classes, reified generics (`call<T>()`), extension functions, `fun interface`, lazy delegates, null safety at API boundaries |
+| **Spring Boot internals** | Writing an auto-configuration starter: `@AutoConfiguration` ordering, `@Conditional*`, `ObjectProvider`, `@ConfigurationProperties` binding, `SmartLifecycle`, SSL bundles, Actuator health contributors |
+| **HTTP semantics (RFC 9110)** | Method idempotency, status code classes, `Retry-After` (both forms), redirects, content negotiation, `Idempotency-Key` |
+| **Resilience engineering** | Circuit breaker state machine, exponential backoff with jitter, bulkhead, deadline propagation, fail-fast vs. wait-for-permit, graceful degradation |
+| **Distributed systems** | Transactional outbox, at-least-once delivery with idempotent consumers, leases and crash recovery, compare-and-set coordination, avoiding dual writes, backpressure |
+| **Rate limiting algorithms** | Token bucket, sliding window log, distributed limits with atomic Redis Lua, clock-skew avoidance, Redis Cluster hash tags |
+| **Kafka** | Producer idempotence and `acks=all`, consumer groups, manual container setup, error handlers, result and dead-letter topics, keeping the library's serializers apart from the app's |
+| **Network security / PKI** | TLS 1.2/1.3, mTLS, trust and key managers, PKCS12/JKS/PEM (PKCS#8), SPKI pinning, hostname verification, certificate expiry checks, building a test CA with `keytool`/`openssl` |
+| **Webhook security** | HMAC-SHA256 signatures, replay protection, timestamp tolerance, constant-time comparison, key rotation |
+| **Concurrency** | Thread-safe state machines, semaphores, `ThreadLocal`, double-checked token refresh with `ReentrantLock`, executor sizing and rejection handling |
+| **Databases** | Portable SQL across vendors, transactional consistency, idempotent inserts through unique constraints, indexes for polling queries, retention |
+| **Observability** | Micrometer timers, histograms, counters and gauges with low-cardinality tags, correlation ids through MDC, structured and masked logging, health semantics |
+| **API and library design** | Pluggable extension points, sensible defaults, fail-fast configuration, typed errors, backward-compatible stored payloads (`StoredRequest.version`) |
+| **Testing** | Integration tests against real sockets, TLS and Kafka; deterministic time; failure injection (timeouts, refused connections, outages); tests in CI with service containers |
+| **DevOps** | Gradle Kotlin DSL with BOM management, GitHub Actions with a Redis service container, migration SQL for Flyway/Liquibase |
+
+## Features
+
+<details>
+<summary><b>Full feature list</b> (click to expand)</summary>
+
+**REST client**
+- Named clients, each with its own Apache HttpClient 5 connection pool, so one slow provider cannot starve the others
+- Separate connect, response and pool-acquire timeouts, plus a **total deadline** that covers all retries
+- JSON (Jackson + Kotlin), form-encoded, raw `String` and `ByteArray` bodies; path templates; a response size cap
+- Correlation id propagated from MDC (`correlationId` / `traceId`)
+- Request and response logging with secrets masked in headers, query strings and JSON fields
+- Clients can be registered at runtime (for example per-tenant endpoints)
+
+**Resilience**
+- Exponential backoff with jitter; `Retry-After` (seconds or HTTP date) is honoured
+- Idempotency-aware retries, with optional auto-generated `Idempotency-Key`
+- Count-based **circuit breaker** with failure-rate and slow-call-rate thresholds and half-open probing, per client or per operation
+- **Bulkhead** that caps concurrent calls
+- Transparent token refresh and a single retry on `401`
+
+**Rate limiting**
+- Token bucket or sliding window
+- LOCAL (in-JVM) or **REDIS** (atomic Lua using Redis server time, Redis Cluster-safe keys)
+- Per-client limit plus per-operation limits
+- Fail modes for a Redis outage: `OPEN`, `CLOSED` or `LOCAL_FALLBACK`
+- **Adaptive cooldown**: an upstream 429/503 with `Retry-After` pauses every caller and every instance
+
+**Security**
+- TLS modes `DEFAULT`, `TLS` (private CA), `MTLS`, and `INSECURE_TRUST_ALL` for development only
+- Key and trust material from PKCS12/JKS, PEM files, or a Spring Boot **SSL bundle**
+- SPKI **certificate pinning**, protocol and cipher allow-lists, a hostname-verification switch
+- Startup validation and expiry warnings for client certificates
+- Auth: Bearer, API key, Basic, OAuth2 client credentials (sent over the client's own mTLS), or your own provider
+
+**Async processing**
+- **Transactional outbox** on plain JDBC (works with JPA, jOOQ or JDBC); a call is scheduled only if your transaction commits
+- **Kafka** transport (multi-instance) or **IN_PROCESS** transport (no broker)
+- Retries with backoff for hours, dead-lettering, deduplication keys, scheduled calls (`notBefore`), cancel and requeue
+- Outcomes published to a result topic or DLT, to in-process listeners, and to **callback webhooks**
+- Crash-safe: work whose lease expires is recovered, and duplicate Kafka deliveries do nothing
+
+**Webhooks**
+- Outbound: HMAC-SHA256 signed when sent (so retries carry a fresh timestamp), delivered through the outbox, one circuit breaker per subscriber host
+- Inbound: signature, timestamp tolerance and **replay protection** (Redis or local), zero-downtime secret rotation, a handler registry
+
+**Operations**
+- Micrometer metrics (calls, attempts, retries, rejections, breaker state, async outcomes)
+- Actuator health indicator showing each breaker's state and failure rates
+
+</details>
 
 ## Quick start
 
@@ -601,87 +707,6 @@ The suite runs against real components, not mocks:
 | Outbox | Spring Boot + H2 with the in-process transport: success, deferred retries, FAILED/DEAD, dedupe, rollback, scheduling, signed callbacks |
 | Kafka | `@EmbeddedKafka`: relay → topic → worker, result and DLT topics |
 | Webhooks | signature, tamper, staleness, replay, rotation, a replay-store outage, the inbound HTTP endpoint |
-
-## Engineering choices
-
-Each choice below lists the alternatives considered and why this one won.
-
-### Architecture
-
-| Decision | Alternatives considered | Why this one |
-|---|---|---|
-| **Spring Boot starter with auto-configuration** | A plain library wired by hand; a sidecar or egress proxy (Envoy) | You add one dependency and some YAML. Optional features turn on through `@ConditionalOnClass` + properties, so a service without Kafka or Redis pays nothing. A sidecar handles TLS and rate limits but cannot know about idempotency keys or business transactions. |
-| **One connection pool per external system** | One shared `HttpClient` | Bulkheading at the socket level: a provider that hangs uses up only its own pool, never the pool another provider's calls need. |
-| **Fixed protection order:** cooldown → rate limit → bulkhead → circuit breaker → HTTP | Any other order | Cheap local checks first. A half-open probe permit is taken last, so it is never spent on a call that would have been throttled anyway. |
-| **A sealed exception hierarchy plus `FailureKind`** | Status codes; one generic exception with a message | The compiler checks `when` branches are exhaustive. Each failure carries `retryable` and `countsAsFailure`, so retry, breaker and async decisions are made once, in the classifier. |
-| **Every built-in bean is `@ConditionalOnMissingBean`** | Inheritance or configuration flags | Each policy (classifier, limiter store, transport, auth, metrics) can be replaced without forking. This is the open/closed principle at the bean level. |
-
-### Correctness under failure
-
-| Decision | Why |
-|---|---|
-| **Retries depend on idempotency.** A read timeout on a POST is classified as "outcome unknown" and never retried. | A retry is only safe when repeating cannot duplicate a side effect. This rule prevents double charges. |
-| **One total deadline across attempts** | Without it, 3 attempts × 10 s timeouts + backoff can far exceed what the caller's own caller will wait. |
-| **Retry-After wins over computed backoff; a large value fails fast** | The upstream knows its own recovery time. Sleeping a request thread for 2 minutes is worse than failing. |
-| **4xx and 429 do not trip the circuit breaker** | They mean the upstream is healthy but rejecting the request. Opening the breaker on them would black out good traffic. |
-| **Async treats local rejections as "not now"** | An open circuit or a rate limit is temporary. Background work can wait, while a user-facing call should fail fast. |
-| **Startup validation of TLS material and certificate expiry** | Misconfiguration surfaces at deploy time, not at 3 a.m. on the first request. |
-| **Recovering the real TLS error on dual-stack hosts** | Found by a test: Apache reports only the last address's error, so a certificate problem appeared as "connection refused". A thread-local records the handshake failure. |
-
-### Distributed systems
-
-| Decision | Alternatives considered | Why this one |
-|---|---|---|
-| **Transactional outbox** | Publish to Kafka after commit; Kafka transactions; CDC (Debezium) | Publishing after commit loses events if the process dies in between. Kafka transactions cannot include the business database. CDC needs extra infrastructure. The outbox needs only the database you already have. |
-| **The database is the source of truth; Kafka carries only a row id** | Full payload in the message | Lost, duplicated or reordered messages are all harmless, because every state change is a compare-and-set on the row. Payloads and secrets stay out of Kafka. |
-| **Compare-and-set claims (`UPDATE … WHERE status = ?`)** | `SELECT … FOR UPDATE SKIP LOCKED`; a distributed lock | Portable across PostgreSQL, MySQL, H2, Oracle and SQL Server, with no lock service. Contention costs at most a wasted `UPDATE`. |
-| **Mark QUEUED *before* publishing, with a lease** | Publish then mark | A worker can never receive a message for a row that is still PENDING. A crash between the two steps is repaired when the lease expires. |
-| **Rate limiting with Redis Lua and `redis.call('TIME')`** | `INCR` + `EXPIRE`; client timestamps | One script means one atomic read-modify-write across all instances. Server time removes clock skew between nodes. Hash-tagged keys keep it Redis Cluster-safe. |
-| **Configurable fail mode for a Redis outage** (`OPEN` / `CLOSED` / `LOCAL_FALLBACK`) | Always fail | Whether to protect the quota or availability is a business decision, so the module leaves it to you. |
-| **Adaptive cooldown shared through Redis** | Each instance learns about the 429 on its own | One 429 pauses the whole fleet instead of N pods each hitting the limit. |
-| **Circuit breaker state kept per instance** | Shared state in Redis | Each instance sees its own network path. A shared breaker would let one bad node black out the fleet, and it puts Redis on the hot path. |
-
-### Security
-
-| Decision | Why |
-|---|---|
-| **The HMAC covers `id.timestamp.body`** | Binding the id and timestamp into the MAC stops replaying an old body under a new timestamp. |
-| **Signing at delivery time, not when enqueued** | A webhook retried 6 hours later still passes the receiver's 5-minute freshness check. |
-| **Constant-time signature comparison and several active secrets** | Prevents timing attacks and allows secret rotation without downtime. |
-| **Replay store down → 503** | A 503 makes the sender retry. Accepting blindly could process the event twice; a 500 would hide the cause. |
-| **SPKI pinning on top of chain validation** | Pinning adds to normal validation instead of replacing it, and pins survive certificate renewal with the same key. |
-| **Secrets masked in headers, query strings and JSON bodies** | Logs are the most common place credentials leak. |
-
-### Tooling and testing
-
-| Decision | Alternatives considered | Why this one |
-|---|---|---|
-| **Own circuit breaker and retry** | Resilience4j | The policy depends on HTTP semantics: which statuses count as failures, POST safety, Retry-After, one deadline across attempts. Written as Resilience4j predicates, that logic spread across many places. This version is about 200 lines under a single lock, uses an injectable clock and is fully tested. |
-| **Apache HttpClient 5** | `RestClient`, `WebClient`, OkHttp | It gives direct control of the pool, the TLS strategy and exact exception types, which the failure taxonomy needs. |
-| **Plain JDBC for the outbox** | JPA entities | Works with any persistence stack and joins the caller's transaction through Spring's DataSource synchronization. |
-| **Real servers in tests** (JDK `HttpServer`/`HttpsServer`, `@EmbeddedKafka`, a Redis CI service) | Mocks / WireMock | Timeouts, TLS handshakes and Kafka redelivery only show up on real sockets. The dual-stack TLS bug above would have been invisible with mocks. |
-| **A generated throwaway PKI** (`scripts/gen-test-certs.sh`) | Committed certificates of unknown origin | Reproducible, documented, and with no secret value. |
-| **Injectable clocks and sleepers** | `Thread.sleep` in tests | Circuit breaker and rate limiter tests are deterministic and fast. |
-
-## Skills used
-
-| Area | Applied in this project |
-|---|---|
-| **Kotlin** | Sealed hierarchies, data classes, reified generics (`call<T>()`), extension functions, `fun interface`, lazy delegates, null safety at API boundaries |
-| **Spring Boot internals** | Writing an auto-configuration starter: `@AutoConfiguration` ordering, `@Conditional*`, `ObjectProvider`, `@ConfigurationProperties` binding, `SmartLifecycle`, SSL bundles, Actuator health contributors |
-| **HTTP semantics (RFC 9110)** | Method idempotency, status code classes, `Retry-After` (both forms), redirects, content negotiation, `Idempotency-Key` |
-| **Resilience engineering** | Circuit breaker state machine, exponential backoff with jitter, bulkhead, deadline propagation, fail-fast vs. wait-for-permit, graceful degradation |
-| **Distributed systems** | Transactional outbox, at-least-once delivery with idempotent consumers, leases and crash recovery, compare-and-set coordination, avoiding dual writes, backpressure |
-| **Rate limiting algorithms** | Token bucket, sliding window log, distributed limits with atomic Redis Lua, clock-skew avoidance, Redis Cluster hash tags |
-| **Kafka** | Producer idempotence and `acks=all`, consumer groups, manual container setup, error handlers, result and dead-letter topics, keeping the library's serializers apart from the app's |
-| **Network security / PKI** | TLS 1.2/1.3, mTLS, trust and key managers, PKCS12/JKS/PEM (PKCS#8), SPKI pinning, hostname verification, certificate expiry checks, building a test CA with `keytool`/`openssl` |
-| **Webhook security** | HMAC-SHA256 signatures, replay protection, timestamp tolerance, constant-time comparison, key rotation |
-| **Concurrency** | Thread-safe state machines, semaphores, `ThreadLocal`, double-checked token refresh with `ReentrantLock`, executor sizing and rejection handling |
-| **Databases** | Portable SQL across vendors, transactional consistency, idempotent inserts through unique constraints, indexes for polling queries, retention |
-| **Observability** | Micrometer timers, histograms, counters and gauges with low-cardinality tags, correlation ids through MDC, structured and masked logging, health semantics |
-| **API and library design** | Pluggable extension points, sensible defaults, fail-fast configuration, typed errors, backward-compatible stored payloads (`StoredRequest.version`) |
-| **Testing** | Integration tests against real sockets, TLS and Kafka; deterministic time; failure injection (timeouts, refused connections, outages); tests in CI with service containers |
-| **DevOps** | Gradle Kotlin DSL with BOM management, GitHub Actions with a Redis service container, migration SQL for Flyway/Liquibase |
 
 ## Limitations and roadmap
 
